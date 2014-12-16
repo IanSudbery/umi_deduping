@@ -95,7 +95,7 @@ import pysam
 import CGAT.Experiment as E
 import random
 import collections
-
+import itertools
 
 def breadth_first_search(node, graph):
     '''Returns all nodes reachable from node in graph
@@ -302,6 +302,18 @@ def get_bundles(insam, ignore_umi=False, subset=None, paired=False,
                 for bundle in reads_dict[p].itervalues():
                     yield bundle
 
+
+def get_umi(read):
+    return read.qname.split("_")[-1]
+
+
+def get_average_umi_distance(umis):
+    if len(umis) == 1:
+        return None
+    dists = [edit_dist(*pair) for pair in itertools.combinations(umis, 2)]
+    return float(sum(dists))/(len(dists))
+
+
 def main(argv=None):
     """script main.
 
@@ -349,7 +361,12 @@ def main(argv=None):
     parser.add_option("--paired", dest="paired", action="store_true",
                       default=False,
                       help="Use second-in-pair position when deduping")
-
+    parser.add_option("--output-stats", dest="stats", action="store_true",
+                      default=False,
+                      help="Output histogram of average pairwise edit"
+                           " distances between UMIs at one base, and after"
+                           " clustering (if applicable) to log file")
+ 
     # add common options (-h/--help, ...) and parse command line
     (options, args) = E.Start(parser, argv=argv)
 
@@ -381,6 +398,9 @@ def main(argv=None):
 
     nInput, nOutput = 0, 0
 
+    pre_cluster_stats = collections.defaultdict(int)
+    post_cluster_stats = collections.defaultdict(int)
+
     for bundle in get_bundles(infile,
                               ignore_umi=options.ignore_umi,
                               subset=float(options.subset),
@@ -389,7 +409,7 @@ def main(argv=None):
                               spliced=options.spliced,
                               soft_clip_threshold=options.soft):
 
-        nOutput +=1
+        nOutput += 1
         nInput += sum([bundle[umi]["count"] for umi in bundle])
 
         if nOutput % 10000 == 0:
@@ -398,15 +418,48 @@ def main(argv=None):
         if nInput % 1000000 == 0:
             E.debug("Read %i input reads" % nInput)
 
+        if options.stats:
+            average_distance = get_average_umi_distance(bundle.keys())
+            pre_cluster_stats[average_distance] += 1
+
         if options.ignore_umi or not options.cluster_umis:
             for umi in bundle:
-         
                 outfile.write(bundle[umi]["read"])
+    
         else:
+            post_cluster_umis = []
             for read in cluster_and_reduce(bundle, options.threshold):
                 outfile.write(read)
+                post_cluster_umis.append(read.qname.split("_")[-1])
+
+            if options.stats:
+                average_distance = get_average_umi_distance(post_cluster_umis)
+                post_cluster_stats[average_distance] += 1
+    
+    if options.stats:
+        outlines = ["\t".join(["Single_UMI",
+                               str(pre_cluster_stats[None]),
+                               str(post_cluster_stats[None])])]
+        max_cluster_size = max(pre_cluster_stats.keys() +
+                               post_cluster_stats.keys())
+        distances = set(pre_cluster_stats.keys() + post_cluster_stats.keys())
+        
+        for i in range(int(max_cluster_size)+1):
+            indexes = [key for key in distances if i <= key < i+1]
+            pre_cluster_sum = sum([pre_cluster_stats[index]
+                                   for index in indexes])
+            post_cluster_sum = sum([post_cluster_stats[index]
+                                    for index in indexes])
+            outlines.append("\t".join(map(str, [i,
+                                                pre_cluster_sum,
+                                                post_cluster_sum])))
+
+        header = ["average_distance\tpre_cluster\tpost_cluster"]
+        options.stderr.write("\n".join(header + outlines) + "\n")
 
     # write footer and output benchmark information.
+    E.info("Number of reads in: %i, Number of reads out: %i" %
+           (nInput, nOutput))
     E.Stop()
 
 if __name__ == "__main__":
